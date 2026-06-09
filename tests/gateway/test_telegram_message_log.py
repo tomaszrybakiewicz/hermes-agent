@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -32,10 +32,11 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.config import Platform, PlatformConfig  # noqa: E402
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult  # noqa: E402
-from gateway.session import SessionSource  # noqa: E402
+from gateway.hooks import HookRegistry  # noqa: E402
 from gateway.message_archive import MessageArchive  # noqa: E402
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult  # noqa: E402
 from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from gateway.session import SessionSource  # noqa: E402
 
 
 class DummyArchiveAdapter(BasePlatformAdapter):
@@ -57,6 +58,14 @@ class DummyArchiveAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"name": "Dummy", "type": "dm"}
+
+
+class RecordingHookRegistry:
+    def __init__(self):
+        self.calls = []
+
+    async def emit(self, event_type, context=None):
+        self.calls.append((event_type, context or {}))
 
 
 @pytest.fixture()
@@ -95,7 +104,6 @@ def test_message_archive_upserts_inbound_and_outbound(tmp_path):
         reply_to_message_id="55",
         media=[{"media_type": "document", "path": "/tmp/a.txt"}],
     )
-    # upsert same outbound id to prove it updates instead of duplicating
     log.log_outbound_message(
         platform="telegram",
         chat_id="123",
@@ -128,11 +136,13 @@ def test_message_archive_upserts_inbound_and_outbound(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_base_handle_message_archives_inbound_before_dispatch():
+async def test_base_handle_message_emits_inbound_hook_before_dispatch():
     adapter = DummyArchiveAdapter()
     adapter._message_handler = AsyncMock(return_value=None)
-    adapter._archive_inbound_event = MagicMock()
     adapter._start_session_processing = MagicMock()
+    hooks = RecordingHookRegistry()
+
+    adapter.set_hook_registry(hooks)
 
     event = MessageEvent(
         text="hello",
@@ -148,14 +158,20 @@ async def test_base_handle_message_archives_inbound_before_dispatch():
 
     await adapter.handle_message(event)
 
-    adapter._archive_inbound_event.assert_called_once_with(event)
+    assert len(hooks.calls) == 1
+    event_type, context = hooks.calls[0]
+    assert event_type == "message:inbound"
+    assert context["event_kind"] == "received"
+    assert context["direction"] == "inbound"
+    assert context["event"] is event
     adapter._start_session_processing.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_base_send_with_retry_archives_successful_outbound_text():
+async def test_base_send_with_retry_emits_successful_outbound_hook():
     adapter = DummyArchiveAdapter()
-    adapter._archive_outbound_message = MagicMock()
+    hooks = RecordingHookRegistry()
+    adapter.set_hook_registry(hooks)
 
     result = await adapter._send_with_retry(
         chat_id="123",
@@ -165,20 +181,25 @@ async def test_base_send_with_retry_archives_successful_outbound_text():
     )
 
     assert result.success is True
-    adapter._archive_outbound_message.assert_called_once()
-    kwargs = adapter._archive_outbound_message.call_args.kwargs
-    assert kwargs["chat_id"] == "123"
-    assert kwargs["text"] == "hello world"
-    assert kwargs["message_id"] == "dummy-1"
-    assert kwargs["reply_to_message_id"] == "44"
+    assert len(hooks.calls) == 1
+    event_type, context = hooks.calls[0]
+    assert event_type == "message:outbound"
+    assert context["event_kind"] == "sent"
+    assert context["direction"] == "outbound"
+    assert context["chat_id"] == "123"
+    assert context["text"] == "hello world"
+    assert context["message_id"] == "dummy-1"
+    assert context["reply_to_message_id"] == "44"
+    assert context["metadata"]["thread_id"] == "99"
 
 
 @pytest.mark.asyncio
-async def test_send_document_logs_outbound_message(adapter, tmp_path):
+async def test_send_document_emits_outbound_hook(adapter, tmp_path):
     file_path = tmp_path / "report.txt"
     file_path.write_text("hello")
     adapter._bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=321))
-    adapter._archive_outbound_message = MagicMock()
+    hooks = RecordingHookRegistry()
+    adapter.set_hook_registry(hooks)
 
     result = await adapter.send_document(
         chat_id="123",
@@ -188,36 +209,98 @@ async def test_send_document_logs_outbound_message(adapter, tmp_path):
     )
 
     assert result == SendResult(success=True, message_id="321")
-    adapter._archive_outbound_message.assert_called_once()
-    kwargs = adapter._archive_outbound_message.call_args.kwargs
-    assert kwargs["chat_id"] == "123"
-    assert kwargs["text"] == "Quarterly report"
-    assert kwargs["message_id"] == "321"
-    assert kwargs["media"][0]["media_type"] == "document"
-    assert kwargs["media"][0]["path"] == str(file_path)
+    assert len(hooks.calls) == 1
+    event_type, context = hooks.calls[0]
+    assert event_type == "message:outbound"
+    assert context["text"] == "Quarterly report"
+    assert context["message_id"] == "321"
+    assert context["media"][0]["media_type"] == "document"
+    assert context["media"][0]["path"] == str(file_path)
 
 
 @pytest.mark.asyncio
-async def test_send_multiple_images_logs_each_sent_photo(adapter):
-    adapter._bot.send_media_group = AsyncMock(return_value=[
-        SimpleNamespace(message_id=11),
-        SimpleNamespace(message_id=12),
-    ])
-    adapter._archive_outbound_message = MagicMock()
-
-    await adapter.send_multiple_images(
-        chat_id="123",
-        images=[
-            ("https://example.com/one.png", "One"),
-            ("https://example.com/two.png", "Two"),
-        ],
-        metadata={"thread_id": "88"},
+async def test_local_hook_can_archive_message_events(tmp_path):
+    db_path = tmp_path / "messages.db"
+    hooks_dir = tmp_path / "hooks"
+    hook_dir = hooks_dir / "message-archive"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text(
+        "name: message-archive\n"
+        "description: archive message events\n"
+        "events: ['message:inbound', 'message:outbound']\n"
+    )
+    (hook_dir / "handler.py").write_text(
+        "from gateway.message_archive import MessageArchive\n"
+        "archive = MessageArchive(r'" + str(db_path) + "')\n"
+        "def handle(event_type, context):\n"
+        "    if event_type == 'message:inbound':\n"
+        "        archive.log_inbound_event(context['event'], event_kind=context.get('event_kind', 'received'))\n"
+        "    elif event_type == 'message:outbound':\n"
+        "        archive.log_outbound_message(\n"
+        "            platform=context['platform'],\n"
+        "            chat_id=context['chat_id'],\n"
+        "            text=context.get('text', ''),\n"
+        "            platform_message_id=context.get('message_id'),\n"
+        "            metadata=context.get('metadata'),\n"
+        "            raw_message=context.get('raw_message'),\n"
+        "            event_kind=context.get('event_kind', 'sent'),\n"
+        "            reply_to_message_id=context.get('reply_to_message_id'),\n"
+        "            media=context.get('media'),\n"
+        "            chat_name=context.get('chat_name'),\n"
+        "            chat_type=context.get('chat_type'),\n"
+        "            user_id=context.get('user_id'),\n"
+        "            user_name=context.get('user_name'),\n"
+        "            thread_id=context.get('thread_id'),\n"
+        "            platform_update_id=context.get('platform_update_id'),\n"
+        "        )\n"
     )
 
-    assert adapter._archive_outbound_message.call_count == 2
-    first = adapter._archive_outbound_message.call_args_list[0].kwargs
-    second = adapter._archive_outbound_message.call_args_list[1].kwargs
-    assert first["message_id"] == "11"
-    assert first["media"][0]["url"] == "https://example.com/one.png"
-    assert second["message_id"] == "12"
-    assert second["media"][0]["url"] == "https://example.com/two.png"
+    reg = HookRegistry()
+    with patch("gateway.hooks.HOOKS_DIR", hooks_dir), patch.object(reg, "_register_builtin_hooks"):
+        reg.discover_and_load()
+
+    adapter = DummyArchiveAdapter()
+    adapter.set_hook_registry(reg)
+    adapter._message_handler = AsyncMock(return_value=None)
+    adapter._start_session_processing = MagicMock()
+
+    inbound_event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_name="Test Chat",
+            chat_type="private",
+            user_id="7",
+            user_name="Alice",
+        ),
+        message_id="55",
+    )
+
+    await adapter.handle_message(inbound_event)
+    await adapter._emit_outbound_message_hook(
+        chat_id="123",
+        text="world",
+        message_id="56",
+        metadata={"thread_id": "99"},
+        raw_message=SimpleNamespace(
+            message_id=56,
+            chat=SimpleNamespace(title="Test Chat", full_name="Test Chat", type="private"),
+            from_user=SimpleNamespace(id=999, full_name="Hermes"),
+        ),
+        event_kind="sent",
+        reply_to_message_id="55",
+    )
+
+    archive = MessageArchive(str(db_path))
+    rows = [
+        tuple(row)
+        for row in archive._conn.execute(
+            "select direction, event_kind, chat_id, thread_id, platform_message_id, text from archived_messages order by id"
+        )
+    ]
+    assert rows == [
+        ("inbound", "received", "123", None, "55", "hello"),
+        ("outbound", "sent", "123", "99", "56", "world"),
+    ]
+    archive.close()

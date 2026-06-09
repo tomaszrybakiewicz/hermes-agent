@@ -20,7 +20,6 @@ import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
-from gateway.message_archive import MessageArchive
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -41,6 +40,19 @@ def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
+
+
+def _thread_id_from_metadata(metadata: dict | None) -> str | None:
+    if not metadata:
+        return None
+    value = (
+        metadata.get("thread_id")
+        or metadata.get("message_thread_id")
+        or metadata.get("direct_messages_topic_id")
+    )
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -1830,7 +1842,7 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
-        self._message_archive: MessageArchive | bool | None = None
+        self._hook_registry: Any = None
         self._message_handler: Optional[MessageHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
@@ -1899,31 +1911,61 @@ class BasePlatformAdapter(ABC):
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
 
-    def _get_message_archive(self) -> Optional[MessageArchive]:
-        cached = getattr(self, "_message_archive", None)
-        if cached is False:
-            return None
-        if cached is not None:
-            return cached
-        try:
-            archive = MessageArchive()
-        except Exception as exc:
-            logger.warning("[%s] Message archive unavailable: %s", self.name, exc)
-            self._message_archive = False
-            return None
-        self._message_archive = archive
-        return archive
+    def set_hook_registry(self, hook_registry: Any) -> None:
+        """Install the gateway hook registry for adapter-level lifecycle events."""
+        self._hook_registry = hook_registry
 
-    def _archive_inbound_event(self, event: "MessageEvent", *, event_kind: str = "received") -> None:
-        archive = self._get_message_archive()
-        if archive is None:
+    async def _emit_gateway_hook(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
+        registry = getattr(self, "_hook_registry", None)
+        if registry is None:
+            return
+        emit = getattr(registry, "emit", None)
+        if not callable(emit):
             return
         try:
-            archive.log_inbound_event(event, event_kind=event_kind)
+            result = emit(event_type, context or {})
+            if inspect.isawaitable(result):
+                await result
         except Exception:
-            logger.warning("[%s] Failed to archive inbound message", self.name, exc_info=True)
+            logger.warning("[%s] Gateway hook '%s' failed", self.name, event_type, exc_info=True)
 
-    def _archive_outbound_message(
+    async def _emit_inbound_message_hook(
+        self,
+        event: "MessageEvent",
+        *,
+        event_kind: str = "received",
+    ) -> None:
+        source = getattr(event, "source", None)
+        await self._emit_gateway_hook(
+            "message:inbound",
+            {
+                "platform": _platform_name(getattr(source, "platform", None) or self.platform),
+                "direction": "inbound",
+                "event_kind": event_kind,
+                "event": event,
+                "source": source,
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "chat_name": getattr(source, "chat_name", None),
+                "chat_type": getattr(source, "chat_type", None),
+                "thread_id": getattr(source, "thread_id", None),
+                "user_id": getattr(source, "user_id_alt", None) or getattr(source, "user_id", None),
+                "user_name": getattr(source, "user_name", None),
+                "message_id": getattr(event, "message_id", None),
+                "platform_update_id": getattr(event, "platform_update_id", None),
+                "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+                "text": getattr(event, "text", "") or "",
+                "media": [
+                    {
+                        "url": url,
+                        "media_type": event.media_types[idx] if idx < len(event.media_types) else None,
+                    }
+                    for idx, url in enumerate(list(getattr(event, "media_urls", []) or []))
+                ],
+                "raw_message": getattr(event, "raw_message", None),
+            },
+        )
+
+    async def _emit_outbound_message_hook(
         self,
         *,
         chat_id: str,
@@ -1941,29 +1983,27 @@ class BasePlatformAdapter(ABC):
         thread_id: Optional[str] = None,
         platform_update_id: Optional[str] = None,
     ) -> None:
-        archive = self._get_message_archive()
-        if archive is None:
-            return
-        try:
-            archive.log_outbound_message(
-                platform=_platform_name(self.platform),
-                chat_id=str(chat_id or ""),
-                text=text,
-                platform_message_id=message_id,
-                metadata=metadata,
-                raw_message=raw_message,
-                event_kind=event_kind,
-                reply_to_message_id=reply_to_message_id,
-                media=media,
-                chat_name=chat_name,
-                chat_type=chat_type,
-                user_id=user_id,
-                user_name=user_name,
-                thread_id=thread_id,
-                platform_update_id=platform_update_id,
-            )
-        except Exception:
-            logger.warning("[%s] Failed to archive outbound message", self.name, exc_info=True)
+        await self._emit_gateway_hook(
+            "message:outbound",
+            {
+                "platform": _platform_name(self.platform),
+                "direction": "outbound",
+                "event_kind": event_kind,
+                "chat_id": str(chat_id or ""),
+                "chat_name": chat_name,
+                "chat_type": chat_type,
+                "thread_id": thread_id or _thread_id_from_metadata(metadata),
+                "user_id": user_id,
+                "user_name": user_name,
+                "message_id": message_id,
+                "platform_update_id": platform_update_id,
+                "reply_to_message_id": reply_to_message_id,
+                "text": text or "",
+                "metadata": metadata,
+                "media": media,
+                "raw_message": raw_message,
+            },
+        )
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -3507,7 +3547,7 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=content,
                 message_id=result.message_id,
@@ -3543,7 +3583,7 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
-                    self._archive_outbound_message(
+                    await self._emit_outbound_message_hook(
                         chat_id=chat_id,
                         text=content,
                         message_id=result.message_id,
@@ -3578,7 +3618,7 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
         if fallback_result.success:
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
                 message_id=fallback_result.message_id,
@@ -4029,7 +4069,7 @@ class BasePlatformAdapter(ABC):
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
-        self._archive_inbound_event(event)
+        await self._emit_inbound_message_hook(event)
 
         session_key = build_session_key(
             event.source,

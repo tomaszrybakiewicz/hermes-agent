@@ -2574,7 +2574,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=content,
                 )
-                self._archive_outbound_message(
+                await self._emit_outbound_message_hook(
                     chat_id=chat_id,
                     text=content,
                     message_id=message_id,
@@ -2607,7 +2607,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=_plain,
                 )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=content,
                 message_id=message_id,
@@ -2768,7 +2768,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, e, exc_info=True,
                 )
                 return SendResult(success=False, error=str(e))
-        self._archive_outbound_message(
+        await self._emit_outbound_message_hook(
             chat_id=chat_id,
             text=first_chunk,
             message_id=message_id,
@@ -2883,7 +2883,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     continuation_message_ids=tuple(continuation_ids),
                 )
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=_strip_mdv2(chunk) if finalize else chunk,
                 message_id=new_id,
@@ -4369,7 +4369,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -4512,7 +4512,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 for idx, sent_msg in enumerate(sent_messages or []):
                     source_url, source_alt = sent_source_rows[idx]
-                    self._archive_outbound_message(
+                    await self._emit_outbound_message_hook(
                         chat_id=chat_id,
                         text=source_alt or "",
                         message_id=str(getattr(sent_msg, "message_id", "")) or None,
@@ -4581,7 +4581,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo",
                     reset_media=lambda: image_file.seek(0),
                 )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -4688,7 +4688,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "document",
                     reset_media=lambda: f.seek(0),
                 )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -4745,7 +4745,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "video",
                     reset_media=lambda: f.seek(0),
                 )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -4806,7 +4806,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "URL photo",
             )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -4853,7 +4853,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "uploaded photo",
                 )
-                self._archive_outbound_message(
+                await self._emit_outbound_message_hook(
                     chat_id=chat_id,
                     text=caption or "",
                     message_id=str(msg.message_id),
@@ -4910,7 +4910,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "animation",
             )
-            self._archive_outbound_message(
+            await self._emit_outbound_message_hook(
                 chat_id=chat_id,
                 text=caption or "",
                 message_id=str(msg.message_id),
@@ -5769,7 +5769,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             store.append_to_transcript(session_entry.session_id, entry)
-            self._archive_inbound_event(event, event_kind="observed")
+            asyncio.create_task(self._emit_inbound_message_hook(event, event_kind="observed"))
             adapter_name = getattr(self, "name", "telegram")
             logger.info(
                 "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",
@@ -5929,7 +5929,6 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5970,7 +5969,6 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -6063,7 +6061,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            self._archive_inbound_event(event)
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -6095,7 +6092,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
-            self._archive_inbound_event(event)
             await self.handle_message(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
@@ -6149,7 +6145,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
-            self._archive_inbound_event(event)
             await self.handle_message(event)
             return
 
@@ -6271,7 +6266,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
-                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6290,7 +6284,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
-                        self._archive_inbound_event(event)
                         await self.handle_message(event)
                         return
 
@@ -6327,7 +6320,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6345,7 +6337,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6385,7 +6376,6 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
-        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
