@@ -2574,13 +2574,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=content,
                 )
-                await self._emit_outbound_message_hook(
-                    chat_id=chat_id,
-                    text=content,
-                    message_id=message_id,
-                    metadata=metadata,
-                    event_kind="edited",
-                )
                 return SendResult(success=True, message_id=message_id)
 
             formatted = self.format_message(content)
@@ -2607,13 +2600,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=_plain,
                 )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=content,
-                message_id=message_id,
-                metadata=metadata,
-                event_kind="edited",
-            )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -2768,22 +2754,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, e, exc_info=True,
                 )
                 return SendResult(success=False, error=str(e))
-        await self._emit_outbound_message_hook(
-            chat_id=chat_id,
-            text=first_chunk,
-            message_id=message_id,
-            metadata=metadata,
-            event_kind="edited",
-        )
-
-        # Step 2 — send each remaining chunk as a continuation message,
-        # threaded as a reply to the previous so the user sees them as a
-        # contiguous block.  We call self._bot.send_message directly so the
-        # continuation skips ``self.send``'s own pre-chunking pass (chunks
-        # are already correctly sized).  Best-effort MarkdownV2 with plain
-        # fallback, mirroring send().
         continuation_ids: list[str] = []
         delivered_chunks = [first_chunk]
+        continuation_events: list[dict[str, Any]] = [
+            {
+                "event_kind": "edited",
+                "message_id": message_id,
+                "text": first_chunk,
+                "metadata": metadata,
+            }
+        ]
         prev_id = message_id
         thread_id = self._metadata_thread_id(metadata)
         for chunk in chunks[1:]:
@@ -2883,14 +2863,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     continuation_message_ids=tuple(continuation_ids),
                 )
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=_strip_mdv2(chunk) if finalize else chunk,
-                message_id=new_id,
-                metadata=metadata,
-                raw_message=sent_msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+            continuation_events.append(
+                {
+                    "event_kind": "sent",
+                    "message_id": new_id,
+                    "text": _strip_mdv2(chunk) if finalize else chunk,
+                    "metadata": metadata,
+                    "raw_message": sent_msg,
+                    "reply_to_message_id": str(reply_to_id) if reply_to_id is not None else None,
+                }
             )
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
@@ -2905,6 +2886,7 @@ class TelegramAdapter(BasePlatformAdapter):
             success=True,
             message_id=last_id,
             continuation_message_ids=tuple(continuation_ids),
+            hook_events=tuple(continuation_events),
         )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
@@ -4369,17 +4351,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": media_kind, "path": audio_path, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
@@ -4581,17 +4553,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo",
                     reset_media=lambda: image_file.seek(0),
                 )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": "photo", "path": image_path, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
@@ -4688,17 +4650,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "document",
                     reset_media=lambda: f.seek(0),
                 )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": "document", "path": file_path, "file_name": display_name, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             logger.warning("[%s] Failed to send document: %s", self.name, e, exc_info=True)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
@@ -4745,17 +4697,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "video",
                     reset_media=lambda: f.seek(0),
                 )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": "video", "path": video_path, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             logger.warning("[%s] Failed to send video: %s", self.name, e, exc_info=True)
             return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
@@ -4806,17 +4748,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "URL photo",
             )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": "photo", "url": image_url, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s",
@@ -4853,17 +4785,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "uploaded photo",
                 )
-                await self._emit_outbound_message_hook(
-                    chat_id=chat_id,
-                    text=caption or "",
-                    message_id=str(msg.message_id),
-                    metadata=metadata,
-                    raw_message=msg,
-                    event_kind="sent",
-                    reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                    media=[{"media_type": "photo", "url": image_url, "caption": caption, "delivery": "uploaded"}],
-                )
-                return SendResult(success=True, message_id=str(msg.message_id))
+                return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
             except Exception as e2:
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
@@ -4910,17 +4832,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "animation",
             )
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=caption or "",
-                message_id=str(msg.message_id),
-                metadata=metadata,
-                raw_message=msg,
-                event_kind="sent",
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                media=[{"media_type": "animation", "url": animation_url, "caption": caption}],
-            )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=msg)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
@@ -5769,7 +5681,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             store.append_to_transcript(session_entry.session_id, entry)
-            asyncio.create_task(self._emit_inbound_message_hook(event, event_kind="observed"))
+            self._emit_inbound_message_hook_nowait(event, event_kind="observed")
             adapter_name = getattr(self, "name", "telegram")
             logger.info(
                 "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",

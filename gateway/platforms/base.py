@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import contextvars
 import inspect
 import ipaddress
 import logging
@@ -23,6 +24,11 @@ from urllib.parse import urlsplit
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+_OUTBOUND_HOOK_EMIT_COUNT: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "gateway_outbound_hook_emit_count",
+    default=0,
+)
 
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
@@ -1576,6 +1582,10 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    # Optional explicit archive/hook payloads. When present, the base adapter
+    # emits these instead of inferring a default outbound event from the method
+    # call. Each entry is merged with the method-derived defaults.
+    hook_events: tuple = ()
 
 
 class EphemeralReply(str):
@@ -1910,6 +1920,50 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        self._install_outbound_hook_wrappers()
+
+    def _install_outbound_hook_wrappers(self) -> None:
+        """Wrap outbound adapter methods so archive hooks fire centrally.
+
+        This keeps message archiving / hook emission tied to the core adapter
+        contract instead of sprinkling platform-specific hook calls across every
+        send/edit implementation.
+        """
+        for method_name in (
+            "send",
+            "edit_message",
+            "send_image",
+            "send_animation",
+            "send_voice",
+            "send_video",
+            "send_document",
+            "send_image_file",
+        ):
+            bound = getattr(self, method_name, None)
+            if not callable(bound):
+                continue
+            func = getattr(type(self), method_name, None)
+            base_func = getattr(BasePlatformAdapter, method_name, None)
+            if func is None or (method_name != "send" and func is base_func):
+                continue
+            if getattr(bound, "__hermes_outbound_hook_wrapped__", False):
+                continue
+
+            async def _wrapped(*args, __bound=bound, __method_name=method_name, **kwargs):
+                start_emit_count = _OUTBOUND_HOOK_EMIT_COUNT.get()
+                result = await __bound(*args, **kwargs)
+                await self._emit_outbound_hooks_for_result(
+                    __method_name,
+                    __bound,
+                    args,
+                    kwargs,
+                    result,
+                    start_emit_count=start_emit_count,
+                )
+                return result
+
+            _wrapped.__hermes_outbound_hook_wrapped__ = True
+            setattr(self, method_name, _wrapped)
 
     def set_hook_registry(self, hook_registry: Any) -> None:
         """Install the gateway hook registry for adapter-level lifecycle events."""
@@ -1965,6 +2019,17 @@ class BasePlatformAdapter(ABC):
             },
         )
 
+    def _emit_inbound_message_hook_nowait(
+        self,
+        event: "MessageEvent",
+        *,
+        event_kind: str = "received",
+    ) -> None:
+        try:
+            asyncio.create_task(self._emit_inbound_message_hook(event, event_kind=event_kind))
+        except RuntimeError:
+            logger.debug("[%s] No running loop for inbound hook '%s'", self.name, event_kind)
+
     async def _emit_outbound_message_hook(
         self,
         *,
@@ -2004,6 +2069,154 @@ class BasePlatformAdapter(ABC):
                 "raw_message": raw_message,
             },
         )
+        _OUTBOUND_HOOK_EMIT_COUNT.set(_OUTBOUND_HOOK_EMIT_COUNT.get() + 1)
+
+    def _default_outbound_hook_payload(
+        self,
+        method_name: str,
+        bound_args: inspect.BoundArguments,
+        result: "SendResult",
+    ) -> Optional[Dict[str, Any]]:
+        arguments = dict(bound_args.arguments)
+        metadata = arguments.get("metadata")
+        payload: Dict[str, Any] = {
+            "chat_id": str(arguments.get("chat_id") or ""),
+            "message_id": result.message_id or arguments.get("message_id"),
+            "metadata": metadata,
+            "raw_message": result.raw_response,
+        }
+
+        if method_name == "send":
+            payload.update(
+                text=arguments.get("content") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+            )
+            return payload
+
+        if method_name == "edit_message":
+            payload.update(
+                text=arguments.get("content") or "",
+                event_kind="edited",
+            )
+            return payload
+
+        if method_name == "send_document":
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": "document",
+                    "path": arguments.get("file_path"),
+                    "file_name": arguments.get("file_name"),
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        if method_name == "send_video":
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": "video",
+                    "path": arguments.get("video_path"),
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        if method_name == "send_image_file":
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": "photo",
+                    "path": arguments.get("image_path"),
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        if method_name == "send_image":
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": "photo",
+                    "url": arguments.get("image_url"),
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        if method_name == "send_animation":
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": "animation",
+                    "url": arguments.get("animation_url"),
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        if method_name == "send_voice":
+            audio_path = arguments.get("audio_path")
+            media_type = "voice" if str(audio_path or "").lower().endswith((".ogg", ".opus")) else "audio"
+            payload.update(
+                text=arguments.get("caption") or "",
+                event_kind="sent",
+                reply_to_message_id=arguments.get("reply_to"),
+                media=[{
+                    "media_type": media_type,
+                    "path": audio_path,
+                    "caption": arguments.get("caption"),
+                }],
+            )
+            return payload
+
+        return None
+
+    async def _emit_outbound_hooks_for_result(
+        self,
+        method_name: str,
+        bound_method: Callable[..., Awaitable["SendResult"]],
+        args: tuple,
+        kwargs: dict,
+        result: Any,
+        *,
+        start_emit_count: int,
+    ) -> None:
+        if not isinstance(result, SendResult) or not result.success:
+            return
+
+        try:
+            bound_args = inspect.signature(bound_method).bind_partial(*args, **kwargs)
+        except Exception:
+            logger.debug("[%s] Failed to bind args for outbound hook on %s", self.name, method_name, exc_info=True)
+            return
+        bound_args.apply_defaults()
+
+        default_payload = self._default_outbound_hook_payload(method_name, bound_args, result)
+        payloads: list[Dict[str, Any]] = []
+
+        if getattr(result, "hook_events", ()):
+            for explicit in result.hook_events:
+                merged = dict(default_payload or {})
+                merged.update(dict(explicit or {}))
+                payloads.append(merged)
+        elif _OUTBOUND_HOOK_EMIT_COUNT.get() == start_emit_count and default_payload is not None:
+            payloads.append(default_payload)
+
+        for payload in payloads:
+            await self._emit_outbound_message_hook(**payload)
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -3547,15 +3760,6 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=content,
-                message_id=result.message_id,
-                metadata=metadata,
-                raw_message=result.raw_response,
-                event_kind="sent",
-                reply_to_message_id=reply_to,
-            )
             return result
 
         error_str = result.error or ""
@@ -3583,15 +3787,6 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
-                    await self._emit_outbound_message_hook(
-                        chat_id=chat_id,
-                        text=content,
-                        message_id=result.message_id,
-                        metadata=metadata,
-                        raw_message=result.raw_response,
-                        event_kind="sent",
-                        reply_to_message_id=reply_to,
-                    )
                     return result
                 error_str = result.error or ""
                 if not (result.retryable or self._is_retryable_error(error_str)):
@@ -3617,16 +3812,6 @@ class BasePlatformAdapter(ABC):
             reply_to=reply_to,
             metadata=metadata,
         )
-        if fallback_result.success:
-            await self._emit_outbound_message_hook(
-                chat_id=chat_id,
-                text=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
-                message_id=fallback_result.message_id,
-                metadata=metadata,
-                raw_message=fallback_result.raw_response,
-                event_kind="sent",
-                reply_to_message_id=reply_to,
-            )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result

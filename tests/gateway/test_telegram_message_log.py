@@ -56,6 +56,49 @@ class DummyArchiveAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
         return SendResult(success=True, message_id="dummy-1", raw_response={"ok": True})
 
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
+        return SendResult(
+            success=True,
+            message_id="doc-7",
+            raw_response={"kind": "document", "path": file_path},
+        )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        return SendResult(
+            success=True,
+            message_id="msg-2",
+            continuation_message_ids=("msg-2",),
+            hook_events=(
+                {
+                    "event_kind": "edited",
+                    "message_id": message_id,
+                    "text": "chunk one",
+                },
+                {
+                    "event_kind": "sent",
+                    "message_id": "msg-2",
+                    "text": "chunk two",
+                    "reply_to_message_id": message_id,
+                },
+            ),
+        )
+
     async def get_chat_info(self, chat_id: str):
         return {"name": "Dummy", "type": "dm"}
 
@@ -194,6 +237,62 @@ async def test_base_send_with_retry_emits_successful_outbound_hook():
 
 
 @pytest.mark.asyncio
+async def test_overridden_send_document_emits_outbound_hook_via_base_wrapper(tmp_path):
+    adapter = DummyArchiveAdapter()
+    hooks = RecordingHookRegistry()
+    adapter.set_hook_registry(hooks)
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello")
+
+    result = await adapter.send_document(
+        chat_id="123",
+        file_path=str(file_path),
+        caption="Quarterly report",
+        file_name="report.txt",
+        reply_to="44",
+        metadata={"thread_id": "77"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "doc-7"
+    assert len(hooks.calls) == 1
+    event_type, context = hooks.calls[0]
+    assert event_type == "message:outbound"
+    assert context["text"] == "Quarterly report"
+    assert context["message_id"] == "doc-7"
+    assert context["reply_to_message_id"] == "44"
+    assert context["thread_id"] == "77"
+    assert context["media"][0]["media_type"] == "document"
+    assert context["media"][0]["path"] == str(file_path)
+    assert context["media"][0]["file_name"] == "report.txt"
+
+
+@pytest.mark.asyncio
+async def test_edit_message_can_emit_explicit_hook_events_via_send_result():
+    adapter = DummyArchiveAdapter()
+    hooks = RecordingHookRegistry()
+    adapter.set_hook_registry(hooks)
+
+    result = await adapter.edit_message(
+        chat_id="123",
+        message_id="msg-1",
+        content="chunk one\nchunk two",
+        finalize=True,
+    )
+
+    assert result.success is True
+    assert result.message_id == "msg-2"
+    assert [event_type for event_type, _ in hooks.calls] == ["message:outbound", "message:outbound"]
+    assert hooks.calls[0][1]["event_kind"] == "edited"
+    assert hooks.calls[0][1]["message_id"] == "msg-1"
+    assert hooks.calls[0][1]["text"] == "chunk one"
+    assert hooks.calls[1][1]["event_kind"] == "sent"
+    assert hooks.calls[1][1]["message_id"] == "msg-2"
+    assert hooks.calls[1][1]["reply_to_message_id"] == "msg-1"
+    assert hooks.calls[1][1]["text"] == "chunk two"
+
+
+@pytest.mark.asyncio
 async def test_send_document_emits_outbound_hook(adapter, tmp_path):
     file_path = tmp_path / "report.txt"
     file_path.write_text("hello")
@@ -208,7 +307,8 @@ async def test_send_document_emits_outbound_hook(adapter, tmp_path):
         metadata={"thread_id": "77"},
     )
 
-    assert result == SendResult(success=True, message_id="321")
+    assert result.success is True
+    assert result.message_id == "321"
     assert len(hooks.calls) == 1
     event_type, context = hooks.calls[0]
     assert event_type == "message:outbound"
