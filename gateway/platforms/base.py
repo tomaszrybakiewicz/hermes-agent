@@ -20,6 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from gateway.message_archive import MessageArchive
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -1829,6 +1830,7 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
+        self._message_archive: MessageArchive | bool | None = None
         self._message_handler: Optional[MessageHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
@@ -1896,6 +1898,72 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+
+    def _get_message_archive(self) -> Optional[MessageArchive]:
+        cached = getattr(self, "_message_archive", None)
+        if cached is False:
+            return None
+        if cached is not None:
+            return cached
+        try:
+            archive = MessageArchive()
+        except Exception as exc:
+            logger.warning("[%s] Message archive unavailable: %s", self.name, exc)
+            self._message_archive = False
+            return None
+        self._message_archive = archive
+        return archive
+
+    def _archive_inbound_event(self, event: "MessageEvent", *, event_kind: str = "received") -> None:
+        archive = self._get_message_archive()
+        if archive is None:
+            return
+        try:
+            archive.log_inbound_event(event, event_kind=event_kind)
+        except Exception:
+            logger.warning("[%s] Failed to archive inbound message", self.name, exc_info=True)
+
+    def _archive_outbound_message(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        message_id: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+        raw_message: Any = None,
+        event_kind: str = "sent",
+        reply_to_message_id: Optional[str] = None,
+        media: Optional[List[Dict[str, Any]]] = None,
+        chat_name: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        platform_update_id: Optional[str] = None,
+    ) -> None:
+        archive = self._get_message_archive()
+        if archive is None:
+            return
+        try:
+            archive.log_outbound_message(
+                platform=_platform_name(self.platform),
+                chat_id=str(chat_id or ""),
+                text=text,
+                platform_message_id=message_id,
+                metadata=metadata,
+                raw_message=raw_message,
+                event_kind=event_kind,
+                reply_to_message_id=reply_to_message_id,
+                media=media,
+                chat_name=chat_name,
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=thread_id,
+                platform_update_id=platform_update_id,
+            )
+        except Exception:
+            logger.warning("[%s] Failed to archive outbound message", self.name, exc_info=True)
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -3439,6 +3507,15 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=content,
+                message_id=result.message_id,
+                metadata=metadata,
+                raw_message=result.raw_response,
+                event_kind="sent",
+                reply_to_message_id=reply_to,
+            )
             return result
 
         error_str = result.error or ""
@@ -3466,6 +3543,15 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    self._archive_outbound_message(
+                        chat_id=chat_id,
+                        text=content,
+                        message_id=result.message_id,
+                        metadata=metadata,
+                        raw_message=result.raw_response,
+                        event_kind="sent",
+                        reply_to_message_id=reply_to,
+                    )
                     return result
                 error_str = result.error or ""
                 if not (result.retryable or self._is_retryable_error(error_str)):
@@ -3491,6 +3577,16 @@ class BasePlatformAdapter(ABC):
             reply_to=reply_to,
             metadata=metadata,
         )
+        if fallback_result.success:
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+                message_id=fallback_result.message_id,
+                metadata=metadata,
+                raw_message=fallback_result.raw_response,
+                event_kind="sent",
+                reply_to_message_id=reply_to,
+            )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -3933,6 +4029,7 @@ class BasePlatformAdapter(ABC):
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
+        self._archive_inbound_event(event)
 
         session_key = build_session_key(
             event.source,

@@ -66,6 +66,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -2320,6 +2321,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
+                sent_text = chunk
                 for _send_attempt in range(3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
@@ -2333,6 +2335,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
+                            sent_text = _strip_mdv2(chunk)
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
@@ -2347,6 +2350,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
+                                sent_text = plain_chunk
                             else:
                                 raise
                         break  # success
@@ -2455,7 +2459,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                sent_message_id = str(msg.message_id) if msg is not None else None
+                message_ids.append(sent_message_id) if sent_message_id is not None else None
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -2569,6 +2574,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=content,
                 )
+                self._archive_outbound_message(
+                    chat_id=chat_id,
+                    text=content,
+                    message_id=message_id,
+                    metadata=metadata,
+                    event_kind="edited",
+                )
                 return SendResult(success=True, message_id=message_id)
 
             formatted = self.format_message(content)
@@ -2595,6 +2607,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=_plain,
                 )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=content,
+                message_id=message_id,
+                metadata=metadata,
+                event_kind="edited",
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -2749,6 +2768,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, e, exc_info=True,
                 )
                 return SendResult(success=False, error=str(e))
+        self._archive_outbound_message(
+            chat_id=chat_id,
+            text=first_chunk,
+            message_id=message_id,
+            metadata=metadata,
+            event_kind="edited",
+        )
 
         # Step 2 — send each remaining chunk as a continuation message,
         # threaded as a reply to the previous so the user sees them as a
@@ -2857,6 +2883,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     continuation_message_ids=tuple(continuation_ids),
                 )
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=_strip_mdv2(chunk) if finalize else chunk,
+                message_id=new_id,
+                metadata=metadata,
+                raw_message=sent_msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+            )
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
@@ -4269,8 +4304,10 @@ class TelegramAdapter(BasePlatformAdapter):
             
             with open(audio_path, "rb") as audio_file:
                 ext = os.path.splitext(audio_path)[1].lower()
+                media_kind = "audio"
                 # .ogg / .opus files -> send as voice (round playable bubble)
                 if ext in {".ogg", ".opus"}:
+                    media_kind = "voice"
                     _voice_thread = self._metadata_thread_id(metadata)
                     reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
                     voice_thread_kwargs = self._thread_kwargs_for_send(
@@ -4296,6 +4333,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         reset_media=lambda: audio_file.seek(0),
                     )
                 elif ext in {".mp3", ".m4a"}:
+                    media_kind = "audio"
                     # Telegram's Bot API sendAudio only accepts MP3 / M4A.
                     _audio_thread = self._metadata_thread_id(metadata)
                     reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -4331,6 +4369,16 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": media_kind, "path": audio_path, "caption": caption}],
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.error(
@@ -4405,6 +4453,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             media: List[Any] = []
             opened_files: List[Any] = []
+            sent_source_rows: List[tuple[str, Optional[str]]] = []
             try:
                 for image_url, alt_text in chunk:
                     caption = alt_text[:1024] if alt_text else None
@@ -4419,8 +4468,10 @@ class TelegramAdapter(BasePlatformAdapter):
                         fh = open(local_path, "rb")
                         opened_files.append(fh)
                         media.append(InputMediaPhoto(media=fh, caption=caption))
+                        sent_source_rows.append((image_url, alt_text))
                     else:
                         media.append(InputMediaPhoto(media=image_url, caption=caption))
+                        sent_source_rows.append((image_url, alt_text))
 
                 if not media:
                     continue
@@ -4445,7 +4496,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": int(chat_id),
@@ -4459,6 +4510,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                for idx, sent_msg in enumerate(sent_messages or []):
+                    source_url, source_alt = sent_source_rows[idx]
+                    self._archive_outbound_message(
+                        chat_id=chat_id,
+                        text=source_alt or "",
+                        message_id=str(getattr(sent_msg, "message_id", "")) or None,
+                        metadata=metadata,
+                        raw_message=sent_msg,
+                        event_kind="sent",
+                        reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                        media=[{"media_type": "photo", "url": source_url, "caption": source_alt}],
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -4518,6 +4581,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo",
                     reset_media=lambda: image_file.seek(0),
                 )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": "photo", "path": image_path, "caption": caption}],
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             error_str = str(e)
@@ -4615,6 +4688,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     "document",
                     reset_media=lambda: f.seek(0),
                 )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": "document", "path": file_path, "file_name": display_name, "caption": caption}],
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] Failed to send document: %s", self.name, e, exc_info=True)
@@ -4662,6 +4745,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     "video",
                     reset_media=lambda: f.seek(0),
                 )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": "video", "path": video_path, "caption": caption}],
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] Failed to send video: %s", self.name, e, exc_info=True)
@@ -4688,10 +4781,10 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
+        _photo_thread = self._metadata_thread_id(metadata)
+        reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
-            _photo_thread = self._metadata_thread_id(metadata)
-            reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
             photo_thread_kwargs = self._thread_kwargs_for_send(
                 chat_id,
                 _photo_thread,
@@ -4712,6 +4805,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata,
                 reply_to_id,
                 "URL photo",
+            )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": "photo", "url": image_url, "caption": caption}],
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -4749,6 +4852,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     metadata,
                     reply_to_id,
                     "uploaded photo",
+                )
+                self._archive_outbound_message(
+                    chat_id=chat_id,
+                    text=caption or "",
+                    message_id=str(msg.message_id),
+                    metadata=metadata,
+                    raw_message=msg,
+                    event_kind="sent",
+                    reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                    media=[{"media_type": "photo", "url": image_url, "caption": caption, "delivery": "uploaded"}],
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
@@ -4796,6 +4909,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata,
                 reply_to_id,
                 "animation",
+            )
+            self._archive_outbound_message(
+                chat_id=chat_id,
+                text=caption or "",
+                message_id=str(msg.message_id),
+                metadata=metadata,
+                raw_message=msg,
+                event_kind="sent",
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                media=[{"media_type": "animation", "url": animation_url, "caption": caption}],
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5646,6 +5769,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             store.append_to_transcript(session_entry.session_id, entry)
+            self._archive_inbound_event(event, event_kind="observed")
             adapter_name = getattr(self, "name", "telegram")
             logger.info(
                 "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",
@@ -5805,6 +5929,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5845,6 +5970,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
+        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -5937,6 +6063,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            self._archive_inbound_event(event)
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -5968,6 +6095,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
+            self._archive_inbound_event(event)
             await self.handle_message(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
@@ -6021,6 +6149,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
+            self._archive_inbound_event(event)
             await self.handle_message(event)
             return
 
@@ -6142,6 +6271,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6160,6 +6290,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
+                        self._archive_inbound_event(event)
                         await self.handle_message(event)
                         return
 
@@ -6196,6 +6327,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
+                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6213,6 +6345,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                    self._archive_inbound_event(event)
                     await self.handle_message(event)
                     return
 
@@ -6252,6 +6385,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
+        self._archive_inbound_event(event)
         await self.handle_message(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
