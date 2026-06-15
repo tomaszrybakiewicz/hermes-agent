@@ -13831,7 +13831,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _edit_accepts_metadata = False
             if _progress_metadata:
                 try:
-                    _edit_params = inspect.signature(adapter.edit_message).parameters
+                    # BasePlatformAdapter installs per-instance outbound-hook wrappers
+                    # with a generic (*args, **kwargs) signature. Inspect the class
+                    # implementation instead of the wrapped bound method so we only
+                    # pass metadata to adapters that actually accept it.
+                    _edit_target = getattr(type(adapter), "edit_message", None)
+                    if _edit_target is None:
+                        _edit_target = adapter.edit_message
+                    _edit_params = inspect.signature(_edit_target).parameters
                     _edit_accepts_metadata = (
                         "metadata" in _edit_params
                         or any(
