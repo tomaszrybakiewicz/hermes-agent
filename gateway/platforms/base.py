@@ -1920,6 +1920,19 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Per-chat typing keeper tasks started by _process_message_background().
+        # Telegram uses one-shot sendChatAction requests, so a leaked keep-typing
+        # loop will keep the "typing…" bubble alive forever even after the
+        # underlying agent task is gone. Track the keeper per chat so a newer run
+        # can evict any stale predecessor deterministically.
+        self._typing_keeper_tasks: Dict[str, asyncio.Task] = {}
+        # Hard ceiling for a single keep-typing loop. Defensive only: a healthy
+        # loop exits via stop_event / task cancellation long before this. If a
+        # cleanup race ever strands one, let it die instead of advertising ghost
+        # activity to the user forever.
+        self._typing_max_lifetime_seconds: float = _float_env(
+            "HERMES_GATEWAY_TYPING_MAX_LIFETIME_SECONDS", 900.0
+        )
         self._install_outbound_hook_wrappers()
 
     def _install_outbound_hook_wrappers(self) -> None:
@@ -3564,6 +3577,77 @@ class BasePlatformAdapter(ABC):
         finally:
             self._typing_paused.discard(chat_id)
 
+    async def _start_typing_keeper(
+        self,
+        chat_id: str,
+        *,
+        metadata=None,
+        stop_event: asyncio.Event | None = None,
+    ) -> asyncio.Task:
+        """Start the per-chat keep-typing loop, evicting any stale predecessor."""
+        previous = self._typing_keeper_tasks.get(chat_id)
+        if previous is not None and not previous.done():
+            previous.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(previous), timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        try:
+            _keep_typing_sig = inspect.signature(self._keep_typing)
+        except (TypeError, ValueError):
+            _keep_typing_sig = None
+        _supports_stop_event = (
+            _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters
+        )
+
+        async def _runner() -> None:
+            max_lifetime = self._typing_max_lifetime_seconds
+            try:
+                if _supports_stop_event:
+                    keep_typing_coro = self._keep_typing(
+                        chat_id,
+                        metadata=metadata,
+                        stop_event=stop_event,
+                    )
+                else:
+                    keep_typing_coro = self._keep_typing(
+                        chat_id,
+                        metadata=metadata,
+                    )
+                if max_lifetime and max_lifetime > 0:
+                    await asyncio.wait_for(keep_typing_coro, timeout=max_lifetime)
+                else:
+                    await keep_typing_coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] Typing watchdog hit %.1fs for chat %s; clearing stale typing loop",
+                    self.name,
+                    max_lifetime,
+                    chat_id,
+                )
+            finally:
+                current = asyncio.current_task()
+                if self._typing_keeper_tasks.get(chat_id) is current:
+                    self._typing_keeper_tasks.pop(chat_id, None)
+
+        task = asyncio.create_task(_runner())
+        self._typing_keeper_tasks[chat_id] = task
+        return task
+
+    async def _stop_typing_keeper(self, chat_id: str, task: asyncio.Task) -> None:
+        """Stop a previously-started keep-typing loop without touching successors."""
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            # Cancellation cleanup must not block adapter shutdown. The typing
+            # task is already cancelled; if the parent task is also cancelling,
+            # let this message-processing task unwind now.
+            pass
+        if self._typing_keeper_tasks.get(chat_id) is task:
+            self._typing_keeper_tasks.pop(chat_id, None)
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -4478,20 +4562,17 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
+        # for real user-visible turns. Internal empty-text events are used for
+        # restart auto-resume and similar control flow; advertising those as
+        # Telegram "typing…" looks like a ghost task to the user.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-        _keep_typing_kwargs = {"metadata": _thread_metadata}
-        try:
-            _keep_typing_sig = inspect.signature(self._keep_typing)
-        except (TypeError, ValueError):
-            _keep_typing_sig = None
-        if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
-            _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
+        typing_task = None
+        if not (getattr(event, "internal", False) and not (event.text or "").strip()):
+            typing_task = await self._start_typing_keeper(
                 event.source.chat_id,
-                **_keep_typing_kwargs,
+                metadata=_thread_metadata,
+                stop_event=interrupt_event,
             )
-        )
 
         async def _stop_typing_task() -> None:
             await self._stop_typing_refresh(

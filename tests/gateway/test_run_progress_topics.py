@@ -1282,6 +1282,50 @@ async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
 
 
 @pytest.mark.asyncio
+async def test_start_typing_keeper_replaces_stale_predecessor():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    first_stop = asyncio.Event()
+    second_stop = asyncio.Event()
+
+    first = await adapter._start_typing_keeper(
+        "chat-typing-replace",
+        stop_event=first_stop,
+    )
+    await asyncio.sleep(0.05)
+    second = await adapter._start_typing_keeper(
+        "chat-typing-replace",
+        stop_event=second_stop,
+    )
+    await asyncio.sleep(0.05)
+
+    assert first.done()
+    assert adapter._typing_keeper_tasks.get("chat-typing-replace") is second
+
+    second_stop.set()
+    await asyncio.wait_for(second, timeout=0.5)
+    assert "chat-typing-replace" not in adapter._typing_keeper_tasks
+
+
+@pytest.mark.asyncio
+async def test_typing_keeper_has_hard_lifetime_ceiling():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    adapter._typing_max_lifetime_seconds = 0.05
+
+    task = await adapter._start_typing_keeper("chat-typing-watchdog")
+    await asyncio.wait_for(task, timeout=0.5)
+
+    assert task.done()
+    assert "chat-typing-watchdog" not in adapter._typing_keeper_tasks
+    stopped_calls = [
+        call
+        for call in adapter.typing
+        if call.get("chat_id") == "chat-typing-watchdog"
+        and call.get("metadata") == {"stopped": True}
+    ]
+    assert stopped_calls
+
+
+@pytest.mark.asyncio
 async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_path):
     """Verbose mode with default tool_preview_length (0) should NOT truncate args.
 
